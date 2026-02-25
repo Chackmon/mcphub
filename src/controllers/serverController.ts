@@ -905,6 +905,7 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       (typeof smartRouting.enabled === 'boolean' ||
         typeof smartRouting.dbUrl === 'string' ||
         typeof smartRouting.embeddingProvider === 'string' ||
+        typeof smartRouting.embeddingEncodingFormat === 'string' ||
         typeof smartRouting.openaiApiBaseUrl === 'string' ||
         typeof smartRouting.openaiApiKey === 'string' ||
         typeof smartRouting.openaiApiEmbeddingModel === 'string' ||
@@ -1105,6 +1106,12 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
           normalized === 'azure' || normalized === 'azure_openai' ? 'azure_openai' : 'openai';
       }
 
+      if (typeof smartRouting.embeddingEncodingFormat === 'string') {
+        const normalized = smartRouting.embeddingEncodingFormat.trim().toLowerCase();
+        systemConfig.smartRouting.embeddingEncodingFormat =
+          normalized === 'base64' || normalized === 'float' ? normalized : 'auto';
+      }
+
       if (typeof smartRouting.enabled === 'boolean') {
         // If enabling Smart Routing, validate required fields
         if (smartRouting.enabled) {
@@ -1198,6 +1205,8 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         previousSmartRoutingConfig.dbUrl !== systemConfig.smartRouting.dbUrl ||
         previousSmartRoutingConfig.embeddingProvider !==
           systemConfig.smartRouting.embeddingProvider ||
+        previousSmartRoutingConfig.embeddingEncodingFormat !==
+          systemConfig.smartRouting.embeddingEncodingFormat ||
         previousSmartRoutingConfig.openaiApiBaseUrl !==
           systemConfig.smartRouting.openaiApiBaseUrl ||
         previousSmartRoutingConfig.openaiApiKey !== systemConfig.smartRouting.openaiApiKey ||

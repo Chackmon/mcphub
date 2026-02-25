@@ -3,6 +3,7 @@ import { VectorEmbeddingRepository } from '../db/repositories/index.js';
 import { Tool } from '../types/index.js';
 import { getAppDataSource, isDatabaseConnected, initializeDatabase } from '../db/connection.js';
 import { getSmartRoutingConfig, type SmartRoutingConfig } from '../utils/smartRouting.js';
+import { toFloat32Array } from '../utils/base64.js';
 import OpenAI from 'openai';
 import axios from 'axios';
 
@@ -74,6 +75,13 @@ const EMBEDDING_DIMENSIONS_SMALL = 1536; // OpenAI's text-embedding-3-small outp
 const EMBEDDING_DIMENSIONS_LARGE = 3072; // OpenAI's text-embedding-3-large outputs 3072 dimensions
 const BGE_DIMENSIONS = 1024; // BAAI/bge-m3 outputs 1024 dimensions
 const FALLBACK_DIMENSIONS = 100; // Fallback implementation uses 100 dimensions
+
+// List of base URLs that support base64 embeddings
+const BASE64_EMBEDDING_SUPPORTED_PROVIDERS = [
+  'https://api.openai.com',
+  'https://api.siliconflow.cn',
+  'https://openrouter.ai',
+];
 
 // pgvector index limits (as of pgvector 0.7.0+)
 // - vector type: up to 2,000 dimensions for both HNSW and IVFFlat
@@ -269,6 +277,11 @@ const getOpenAIClient = async () => {
   });
 };
 
+// Check if the provider supports base64 embeddings
+const supportBase64Embeddings = async (baseURL: string = ''): Promise<boolean> => {
+  return !baseURL || BASE64_EMBEDDING_SUPPORTED_PROVIDERS.some((url) => baseURL.startsWith(url));
+};
+
 /**
  * Generate text embedding using OpenAI's embedding model
  *
@@ -319,12 +332,28 @@ async function generateEmbedding(text: string): Promise<number[]> {
   // Truncate text if it's too long (OpenAI has token limits)
   const truncatedText = text.length > 8000 ? text.substring(0, 8000) : text;
 
+  // Determine encoding format based on configuration
+  const encodingFormatSetting = smartRoutingConfig.embeddingEncodingFormat || 'auto';
+  let encodingFormat: 'base64' | 'float';
+  if (encodingFormatSetting === 'auto') {
+    const canUseBase64 = await supportBase64Embeddings(config.baseURL);
+    encodingFormat = canUseBase64 ? 'base64' : 'float';
+  } else {
+    encodingFormat = encodingFormatSetting;
+  }
+
   try {
     // Call OpenAI's embeddings API
     const response = await openai.embeddings.create({
       model: config.embeddingModel, // Modern model with better performance
+      encoding_format: encodingFormat,
       input: truncatedText,
     });
+
+    if (encodingFormat === 'base64' && typeof response.data[0].embedding === 'string') {
+      const embeddingBase64Str = response.data[0].embedding as unknown as string;
+      return toFloat32Array(embeddingBase64Str);
+    }
 
     // Return the embedding
     return response.data[0].embedding;
@@ -903,9 +932,13 @@ async function checkDatabaseVectorDimensions(dimensionsNeeded: number): Promise<
       }
 
       // Alter the column type with the new dimensions
+      // Use halfvec for dimensions > 2000, vector otherwise
+      const vectorType = dimensionsNeeded <= VECTOR_MAX_DIMENSIONS ? 'vector' : 'halfvec';
+      console.log(`Using ${vectorType} type for ${dimensionsNeeded} dimensions`);
+
       await getAppDataSource().query(`
         ALTER TABLE vector_embeddings 
-        ALTER COLUMN embedding TYPE vector(${dimensionsNeeded});
+        ALTER COLUMN embedding TYPE ${vectorType}(${dimensionsNeeded});
       `);
 
       // Create appropriate vector index using the helper function
