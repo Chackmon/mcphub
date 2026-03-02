@@ -7,6 +7,8 @@ import {
   ListToolsRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
   ServerCapabilities,
 } from '@modelcontextprotocol/sdk/types.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -26,7 +28,13 @@ import { removeServerToolEmbeddings, saveToolsAsVectorEmbeddings } from './vecto
 import { OpenAPIClient } from '../clients/openapi.js';
 import { RequestContextService } from './requestContextService.js';
 import { getDataService } from './services.js';
-import { getServerDao, getSystemConfigDao, ServerConfigWithName } from '../dao/index.js';
+import {
+  getServerDao,
+  getSystemConfigDao,
+  getBuiltinPromptDao,
+  getBuiltinResourceDao,
+  ServerConfigWithName,
+} from '../dao/index.js';
 import { initializeAllOAuthClients } from './oauthService.js';
 import { createOAuthProvider } from './mcpOAuthProvider.js';
 import {
@@ -259,6 +267,36 @@ const cleanInputSchema = (schema: any): any => {
   delete cleanedSchema.$schema;
 
   return cleanedSchema;
+};
+
+// Normalize prompt payload to satisfy MCP ListPrompts response schema
+const normalizePromptForList = (prompt: {
+  name: string;
+  title?: string;
+  description?: string;
+  arguments?: any[];
+}) => {
+  return {
+    name: prompt.name,
+    title: prompt.title || prompt.name,
+    description: prompt.description || '',
+    arguments: Array.isArray(prompt.arguments) ? prompt.arguments : [],
+  };
+};
+
+// Normalize resource payload to avoid nullable DB fields violating MCP schema
+const normalizeResourceForList = (resource: {
+  uri: string;
+  name?: string | null;
+  description?: string | null;
+  mimeType?: string | null;
+}) => {
+  return {
+    uri: resource.uri,
+    name: resource.name || '',
+    description: resource.description || '',
+    mimeType: resource.mimeType || '',
+  };
 };
 
 // Store all server information
@@ -570,6 +608,7 @@ export const initializeClientsFromSettings = async (
           error: null,
           tools: [],
           prompts: [],
+          resources: [],
           createTime: Date.now(),
           enabled: false,
         });
@@ -604,6 +643,7 @@ export const initializeClientsFromSettings = async (
             error: 'Missing OpenAPI specification URL or schema',
             tools: [],
             prompts: [],
+            resources: [],
             createTime: Date.now(),
           });
           continue;
@@ -617,6 +657,7 @@ export const initializeClientsFromSettings = async (
           error: null,
           tools: [],
           prompts: [],
+          resources: [],
           createTime: Date.now(),
           enabled: expandedConf.enabled === undefined ? true : expandedConf.enabled,
           config: expandedConf, // Store reference to expanded config for OpenAPI passthrough headers
@@ -696,6 +737,7 @@ export const initializeClientsFromSettings = async (
         error: null,
         tools: [],
         prompts: [],
+        resources: [],
         client,
         transport,
         options: requestOptions,
@@ -751,16 +793,42 @@ export const initializeClientsFromSettings = async (
                 console.log(
                   `Successfully listed ${prompts.prompts.length} prompts for server: ${name}`,
                 );
-                serverInfo.prompts = prompts.prompts.map((prompt) => ({
-                  name: `${name}${getNameSeparator()}${prompt.name}`,
-                  title: prompt.title,
-                  description: prompt.description,
-                  arguments: prompt.arguments,
-                }));
+                serverInfo.prompts = prompts.prompts.map((prompt) =>
+                  normalizePromptForList({
+                    name: `${name}${getNameSeparator()}${prompt.name}`,
+                    title: prompt.title,
+                    description: prompt.description,
+                    arguments: prompt.arguments,
+                  }),
+                );
               })
               .catch((error) => {
                 console.error(
                   `Failed to list prompts for server ${name} by error: ${error} with stack: ${error.stack}`,
+                );
+                dataError = error;
+              });
+          }
+
+          if (capabilities?.resources) {
+            client
+              .listResources({}, initRequestOptions || requestOptions)
+              .then((resources) => {
+                console.log(
+                  `Successfully listed ${resources.resources.length} resources for server: ${name}`,
+                );
+                serverInfo.resources = resources.resources.map((resource) =>
+                  normalizeResourceForList({
+                    uri: resource.uri,
+                    name: resource.name,
+                    description: resource.description,
+                    mimeType: resource.mimeType,
+                  }),
+                );
+              })
+              .catch((error) => {
+                console.error(
+                  `Failed to list resources for server ${name} by error: ${error} with stack: ${error.stack}`,
                 );
                 dataError = error;
               });
@@ -865,6 +933,7 @@ export const getServersInfo = async (
         error: null,
         tools: [],
         prompts: [],
+        resources: [],
         createTime: Date.now(),
         enabled: isEnabled,
       });
@@ -881,7 +950,7 @@ export const getServersInfo = async (
 
   const infos = filterServerInfos
     .filter((info) => requestedServerNames.has(info.name)) // Only include requested servers
-    .map(({ name, status, tools, prompts, createTime, error, oauth }) => {
+    .map(({ name, status, tools, prompts, resources, createTime, error, oauth }) => {
       const serverConfig = allServers.find((server) => server.name === name);
       const enabled = serverConfig ? serverConfig.enabled !== false : true;
       const resolvedType = inferServerType(serverConfig);
@@ -911,6 +980,7 @@ export const getServersInfo = async (
         error,
         tools: toolsWithEnabled,
         prompts: promptsWithEnabled,
+        resources,
         createTime,
         enabled,
         oauth: oauth
@@ -1545,11 +1615,32 @@ export const handleCallToolRequest = async (request: any, extra: any) => {
 export const handleGetPromptRequest = async (request: any, extra: any) => {
   try {
     const { name, arguments: promptArgs } = request.params;
+
+    // Check built-in prompts first
+    const builtinPrompt = await getBuiltinPromptDao().findByName(name);
+    if (builtinPrompt && builtinPrompt.enabled !== false) {
+      // Perform {{param}} template substitution
+      let content = builtinPrompt.template;
+      if (promptArgs) {
+        for (const [key, value] of Object.entries(promptArgs)) {
+          content = content.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), String(value));
+        }
+      }
+      return {
+        messages: [
+          {
+            role: 'user',
+            content: { type: 'text', text: content },
+          },
+        ],
+      };
+    }
+
     let server: ServerInfo | undefined;
     if (extra && extra.server) {
       server = getServerByName(extra.server);
     } else {
-      // Find the first server that has this tool
+      // Find the first server that has this prompt
       server = serverInfos.find(
         (serverInfo) =>
           serverInfo.status === 'connected' &&
@@ -1598,6 +1689,17 @@ export const handleListPromptsRequest = async (_: any, extra: any) => {
   const group = getGroup(sessionId);
   console.log(`Handling ListPromptsRequest for group: ${group}`);
 
+  // Start with built-in prompts (only enabled ones)
+  const builtinPrompts = await getBuiltinPromptDao().findEnabled();
+  const allPrompts: any[] = builtinPrompts.map((bp) =>
+    normalizePromptForList({
+      name: bp.name,
+      title: bp.title,
+      description: bp.description,
+      arguments: bp.arguments,
+    }),
+  );
+
   // Need to filter servers based on group asynchronously
   const filteredServerInfos = [];
   for (const serverInfo of getDataService().filterData(serverInfos)) {
@@ -1616,7 +1718,6 @@ export const handleListPromptsRequest = async (_: any, extra: any) => {
     }
   }
 
-  const allPrompts: any[] = [];
   for (const serverInfo of filteredServerInfos) {
     if (serverInfo.prompts && serverInfo.prompts.length > 0) {
       // Filter prompts based on server configuration
@@ -1647,10 +1748,10 @@ export const handleListPromptsRequest = async (_: any, extra: any) => {
       // Apply custom descriptions from server configuration
       const promptsWithCustomDescriptions = enabledPrompts.map((prompt: any) => {
         const promptConfig = serverConfig?.prompts?.[prompt.name];
-        return {
+        return normalizePromptForList({
           ...prompt,
           description: promptConfig?.description || prompt.description, // Use custom description if available
-        };
+        });
       });
 
       allPrompts.push(...promptsWithCustomDescriptions);
@@ -1660,6 +1761,121 @@ export const handleListPromptsRequest = async (_: any, extra: any) => {
   return {
     prompts: allPrompts,
   };
+};
+
+export const handleListResourcesRequest = async (_: any, extra: any) => {
+  const sessionId = extra.sessionId || '';
+  const group = getGroup(sessionId);
+  console.log(`Handling ListResourcesRequest for group: ${group}`);
+
+  // Start with built-in resources (only enabled ones)
+  const builtinResources = await getBuiltinResourceDao().findEnabled();
+  const allResources: any[] = builtinResources.map((br) =>
+    normalizeResourceForList({
+      uri: br.uri,
+      name: br.name,
+      description: br.description,
+      mimeType: br.mimeType,
+    }),
+  );
+
+  // Add resources from connected MCP servers
+  const filteredServerInfos = [];
+  for (const serverInfo of getDataService().filterData(serverInfos)) {
+    if (serverInfo.enabled === false) continue;
+    if (!group) {
+      filteredServerInfos.push(serverInfo);
+      continue;
+    }
+    const serversInGroup = await getServersInGroup(group);
+    if (!serversInGroup || serversInGroup.length === 0) {
+      if (serverInfo.name === group) filteredServerInfos.push(serverInfo);
+      continue;
+    }
+    if (serversInGroup.includes(serverInfo.name)) {
+      filteredServerInfos.push(serverInfo);
+    }
+  }
+
+  for (const serverInfo of filteredServerInfos) {
+    if (serverInfo.resources && serverInfo.resources.length > 0) {
+      // Filter resources based on server configuration
+      const serverConfig = await getServerDao().findById(serverInfo.name);
+
+      let enabledResources = serverInfo.resources;
+      if (serverConfig && serverConfig.resources) {
+        enabledResources = serverInfo.resources.filter((resource: any) => {
+          const resourceConfig = serverConfig.resources?.[resource.uri];
+          return resourceConfig?.enabled !== false;
+        });
+      }
+
+      // Apply custom descriptions from server configuration
+      const resourcesWithCustomDescriptions = enabledResources.map((resource: any) => {
+        const resourceConfig = serverConfig?.resources?.[resource.uri];
+        return normalizeResourceForList({
+          ...resource,
+          description: resourceConfig?.description || resource.description,
+        });
+      });
+
+      allResources.push(...resourcesWithCustomDescriptions);
+    }
+  }
+
+  return {
+    resources: allResources,
+  };
+};
+
+export const handleReadResourceRequest = async (request: any, _extra: any) => {
+  try {
+    const { uri } = request.params;
+
+    // Check built-in resources first
+    const builtinResource = await getBuiltinResourceDao().findByUri(uri);
+    if (builtinResource && builtinResource.enabled !== false) {
+      return {
+        contents: [
+          {
+            uri: builtinResource.uri,
+            mimeType: builtinResource.mimeType || 'text/plain',
+            text: builtinResource.content,
+          },
+        ],
+      };
+    }
+
+    // Find the server that owns this resource
+    const server = serverInfos.find(
+      (serverInfo) =>
+        serverInfo.status === 'connected' &&
+        serverInfo.enabled !== false &&
+        serverInfo.resources?.find((resource) => resource.uri === uri),
+    );
+
+    if (!server) {
+      throw new Error(`Resource not found: ${uri}`);
+    }
+
+    const result = await server.client?.readResource({ uri });
+    if (!result) {
+      throw new Error(`Failed to read resource: ${uri}`);
+    }
+
+    return result;
+  } catch (error) {
+    console.error(`Error handling ReadResourceRequest: ${error}`);
+    return {
+      contents: [
+        {
+          uri: request.params?.uri || '',
+          mimeType: 'text/plain',
+          text: `Error: ${error}`,
+        },
+      ],
+    };
+  }
 };
 
 // Create McpServer instance
@@ -1682,6 +1898,8 @@ export const createMcpServer = (name: string, version: string, group?: string): 
   server.setRequestHandler(CallToolRequestSchema, handleCallToolRequest);
   server.setRequestHandler(GetPromptRequestSchema, handleGetPromptRequest);
   server.setRequestHandler(ListPromptsRequestSchema, handleListPromptsRequest);
+  server.setRequestHandler(ListResourcesRequestSchema, handleListResourcesRequest);
+  server.setRequestHandler(ReadResourceRequestSchema, handleReadResourceRequest);
   return server;
 };
 
